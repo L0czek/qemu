@@ -3138,6 +3138,8 @@ if targetos == 'darwin'
   entitlement = find_program('scripts/entitlement.sh')
 endif
 
+subdir('fuzzer')
+
 emulators = {}
 foreach target : target_dirs
   config_target = config_target_mak[target]
@@ -3169,6 +3171,8 @@ foreach target : target_dirs
 
     arch_srcs += config_devices_h[target]
     link_args += ['@block.syms', '@qemu.syms']
+
+    arch_srcs += fuzzer_files
   else
     abi = config_target['TARGET_ABI_DIR']
     target_type='user'

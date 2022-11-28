@@ -1022,3 +1022,5 @@ DEF_HELPER_FLAGS_6(gvec_bfmlal_idx, TCG_CALL_NO_RWG,
 #endif
 
 #include "helper-mve.h"
+
+#include "fuzzer/helper.h"
