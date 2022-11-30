@@ -22,6 +22,13 @@ SRST
     Display version information and exit
 ERST
 
+DEF("testcase", HAS_ARG, QEMU_OPTION_testcase,
+    "-testcase      Testcase for fuzzer\n", QEMU_ARCH_ALL)
+SRST
+``-testcase``
+    Testcase for fuzzer
+ERST
+
 DEF("machine", HAS_ARG, QEMU_OPTION_machine, \
     "-machine [type=]name[,prop[=value][,...]]\n"
     "                selects emulated machine ('-machine help' for list)\n"

@@ -129,6 +129,7 @@
 #include "qemu/guest-random.h"
 
 #include "config-host.h"
+#include "fuzzer/fuzzer_api.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -2819,6 +2820,8 @@ void qemu_init(int argc, char **argv, char **envp)
 
     qemu_init_subsystems();
 
+    fuzzer_init();
+
     /* first pass of option parsing */
     optind = 1;
     while (optind < argc) {
@@ -3359,6 +3362,9 @@ void qemu_init(int argc, char **argv, char **envp)
                     }
                     break;
                 }
+            case QEMU_OPTION_testcase:
+                fuzzer_set_testcase_file(optarg);
+                break;
             case QEMU_OPTION_accel:
                 accel_opts = qemu_opts_parse_noisily(qemu_find_opts("accel"),
                                                      optarg, true);

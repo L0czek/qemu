@@ -1,4 +1,7 @@
 #include "fuzzer.h"
+#include "block/aio.h"
+#include "fuzzer_api.h"
+#include "migration/snapshot.h"
 #include "qemu/osdep.h"
 
 #include "cpu.h"
@@ -7,6 +10,7 @@
 #include "exec/exec-all.h"
 #include "qemu/qemu-print.h"
 #include "qemu/typedefs.h"
+#include "sysemu/cpus.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
 #include "qemu/log.h"
@@ -16,12 +20,15 @@
 
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
+#include "qemu/main-loop.h"
+#include "qapi/error.h"
 
 #include "exec/log.h"
 #include "tcg/tcg.h"
 #include "translate.h"
 #include <bits/pthreadtypes.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -137,12 +144,13 @@ static void set_reg(uint8_t n, target_ulong v) {
 #define FUZZER_FAIL -69
 
 #define FUZZER_OS_STATE_FD 199
+#define FUZZER_RESTORE_EVENT_FD 200
 #define FUZZER_BITMAP_SIZE 1 << 16
 
 typedef struct {
     sem_t sem;
     int v;
-} __attribute__((packed)) os_state_t;
+} os_state_t;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -154,7 +162,12 @@ typedef struct {
     char *testcase;
     size_t testcase_size;
     os_state_t *os_state;
+    bool state_saved;
     bool do_restore;
+
+    QEMUBH *savevm_cb;
+    QEMUBH *loadvm_cb;
+
     char bitmap[FUZZER_BITMAP_SIZE];
 } fuzzer_t;
 
@@ -172,6 +185,63 @@ static void fuzzer_unlock(fuzzer_t *fuzzer) {
     pthread_mutex_unlock(&fuzzer->mutex);
 }
 
+static void vmsave_cb(void *_) {
+    LOG("Saving snapshot\n");
+
+    Error *errp = NULL;
+    if (!save_snapshot("fuzzer", true, NULL, false, NULL, &errp)) {
+        LOG("Failed to save snapshot, exiting\n");
+        error_report_err(errp); 
+        exit(FUZZER_FAIL);
+    }
+    LOG("Snapshot saved\n");
+
+    resume_all_vcpus();
+    LOG("vCPUs resumed\n");
+}
+
+static void loadvm_cb(void *_) {
+    LOG("Loading vm snapshot\n");
+    
+    Error *errp = NULL;
+    if (!load_snapshot("fuzzer", NULL, false, NULL, &errp)) {
+        LOG("Failed to load vm snapshot, exiting\n");
+        error_report_err(errp);
+        exit(FUZZER_FAIL);
+    }
+    LOG("Snapshot loaded successfully\n");
+
+    resume_all_vcpus();
+    LOG("All vCPUs resumed\n");
+}
+
+static void vmsave(fuzzer_t *f) {
+    qemu_mutex_lock_iothread();
+    pause_all_vcpus();
+    
+    f->savevm_cb = qemu_bh_new(&vmsave_cb, NULL);
+    f->loadvm_cb = qemu_bh_new(&loadvm_cb, NULL);
+    qemu_bh_schedule(f->savevm_cb);
+
+    qemu_mutex_unlock_iothread();
+    LOG("vmsave: All vcpu paused\n");
+}
+
+static void vmload(fuzzer_t *f) {
+    if (!f->state_saved) {
+        LOG("VM state not saved, exiting\n");
+        exit(FUZZER_FAIL);
+    }
+
+    qemu_mutex_lock_iothread();
+    pause_all_vcpus();
+
+    qemu_bh_schedule(f->loadvm_cb);
+
+    qemu_mutex_unlock_iothread();
+    LOG("vmload: All vcpus paused\n");
+}
+
 static void await_fuzzer(fuzzer_t *f) {
     kill(getpid(), SIGSTOP);
     sem_wait(&f->os_state->sem);
@@ -186,14 +256,21 @@ static void send_state(fuzzer_t *f, int v) {
     }
 
     if (f->do_restore) {
-        //TODO: restore here
+        vmload(f);
     } else {
-        exit(0);
+        exit(v);
     }
 }
 
 void HELPER(fuzzer_forkserver)(void) {
+    fuzzer_t *f = fuzzer_lock();
 
+    if (!f->state_saved) {
+        vmsave(f);
+        f->state_saved = true;
+    }
+    
+    fuzzer_unlock(f);
 }
 
 void HELPER(fuzzer_begin)(void) {
@@ -219,6 +296,11 @@ void HELPER(fuzzer_fetch_testcase)(void) {
     fuzzer_t *f = fuzzer_lock();
     
     if (!f->testcase) {
+        if (!f->testcase_path) {
+            LOG("No testcase specyfing, exitting\n");
+            exit(FUZZER_FAIL);
+        }
+
         FILE *file = fopen(f->testcase_path, "r");
         fseek(file, 0, SEEK_END);
         size_t size = ftell(file);
@@ -280,6 +362,13 @@ void fuzzer_set_testcase_file(const char *path) {
     fuzzer_unlock(f);
 }
 
+static void restore_event_handler(void *_) {
+    fuzzer_t *f = fuzzer_lock();
+    LOG("Requested to restore vm\n");
+    send_state(f, __W_EXITCODE(0, SIGUSR1));
+    fuzzer_unlock(f);
+}
+
 void fuzzer_init(void) {
     fuzzer_t *f = fuzzer_lock();
     
@@ -292,8 +381,16 @@ void fuzzer_init(void) {
         0
     );
 
-    if (!f->os_state) {
+    if (f->os_state == MAP_FAILED) {
+        f->os_state = NULL;
         LOG("Didn't connect to shared mem for passing OS state\n");
+    }
+
+    f->do_restore = !getenv("FUZZER_RUN_SINGLE");
+
+    if (fcntl(FUZZER_RESTORE_EVENT_FD, F_GETFD) != -1) {
+        // restore event is valid
+        qemu_set_fd_handler(FUZZER_RESTORE_EVENT_FD, &restore_event_handler, NULL, NULL);
     }
 
     fuzzer_unlock(f);
