@@ -145,8 +145,8 @@ static void set_reg(uint8_t n, target_ulong v) {
 
 #define FUZZER_FAIL -69
 
-#define FUZZER_OS_STATE_FD 199
-#define FUZZER_RESTORE_EVENT_FD 200
+#define FUZZER_OS_STATE_FD 399
+#define FUZZER_RESTORE_EVENT_FD 400
 #define FUZZER_BITMAP_SIZE 1 << 16
 
 typedef struct {
@@ -241,16 +241,17 @@ static void vmload(fuzzer_t *f) {
         exit(FUZZER_FAIL);
     }
 
-    qemu_mutex_lock_iothread();
 
     // Close all other vCPUs
     fuzzer_unlock(f);
+    qemu_mutex_lock_iothread();
     pause_all_vcpus();
-    fuzzer_lock();
 
     qemu_bh_schedule(f->loadvm_cb);
 
     qemu_mutex_unlock_iothread();
+    fuzzer_lock();
+
     LOG("vmload: All vcpus paused\n");
 }
 
@@ -431,7 +432,7 @@ void fuzzer_init(void) {
 void fuzzer_maybe_log_pc(target_ulong pc) {
     fuzzer_t *f = fuzzer_lock();
 
-    if (f->coverage_active && (pc >= f->base && f->base + f->limit <= pc) && f->bitmap) {
+    if (f->coverage_active && (pc >= f->base && pc < f->base + f->limit) && f->bitmap) {
         target_ulong hash = pc << 4 ^ f->prev_pc;
         f->prev_pc = pc;
         TCGv_i64 h = tcg_const_i64(hash);
