@@ -36,7 +36,9 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <unistd.h>
 
 static void log_to_file(FILE *f, const char * file, int line, const char *fmt, va_list list) {
@@ -168,12 +170,15 @@ typedef struct {
     QEMUBH *savevm_cb;
     QEMUBH *loadvm_cb;
 
-    char bitmap[FUZZER_BITMAP_SIZE];
+    target_ulong prev_pc;
+    char *bitmap;
 } fuzzer_t;
 
 static fuzzer_t gFuzzer = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .coverage_active = false
+    .coverage_active = false,
+    .base = 0,
+    .limit = (target_ulong) 0xffffffffffffffffULL
 };
 
 static fuzzer_t *fuzzer_lock(void) {
@@ -217,7 +222,10 @@ static void loadvm_cb(void *_) {
 
 static void vmsave(fuzzer_t *f) {
     qemu_mutex_lock_iothread();
+
+    fuzzer_unlock(f);
     pause_all_vcpus();
+    fuzzer_lock();
     
     f->savevm_cb = qemu_bh_new(&vmsave_cb, NULL);
     f->loadvm_cb = qemu_bh_new(&loadvm_cb, NULL);
@@ -234,7 +242,11 @@ static void vmload(fuzzer_t *f) {
     }
 
     qemu_mutex_lock_iothread();
+
+    // Close all other vCPUs
+    fuzzer_unlock(f);
     pause_all_vcpus();
+    fuzzer_lock();
 
     qemu_bh_schedule(f->loadvm_cb);
 
@@ -352,7 +364,7 @@ void HELPER(fuzzer_log)(void) {
 
 void HELPER(fuzzer_log_pc)(uint64_t h) {
     fuzzer_t *f = fuzzer_lock();
-    f->bitmap[h]++;
+    f->bitmap[h % FUZZER_BITMAP_SIZE]++;
     fuzzer_unlock(f);
 }
 
@@ -393,14 +405,35 @@ void fuzzer_init(void) {
         qemu_set_fd_handler(FUZZER_RESTORE_EVENT_FD, &restore_event_handler, NULL, NULL);
     }
 
+    const char *shmid = getenv("__AFL_SHM_ID");
+    if (shmid) {
+        int id = atoi(shmid);
+
+        if (id == -1) {
+            LOG("Invalid AFL's shared memory id `%s`, exiting\n", shmid);
+            exit(FUZZER_FAIL);
+        }
+
+        f->bitmap = shmat(id, NULL, 0);
+        if (f->bitmap == (void *) -1) {
+            LOG("Failed to mount AFL's shared memory: %s\n", strerror(errno));
+            exit(FUZZER_FAIL);
+        }
+
+    } else {
+        f->bitmap = NULL;
+    }
+
+
     fuzzer_unlock(f);
 }
 
 void fuzzer_maybe_log_pc(target_ulong pc) {
     fuzzer_t *f = fuzzer_lock();
 
-    if (f->coverage_active && (pc >= f->base && f->base + f->limit <= pc)) {
-        target_ulong hash = pc << 1 ^ pc;
+    if (f->coverage_active && (pc >= f->base && f->base + f->limit <= pc) && f->bitmap) {
+        target_ulong hash = pc << 4 ^ f->prev_pc;
+        f->prev_pc = pc;
         TCGv_i64 h = tcg_const_i64(hash);
         gen_helper_fuzzer_log_pc(h);
     }
