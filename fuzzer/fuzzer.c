@@ -1,7 +1,11 @@
 #include "fuzzer.h"
 #include "block/aio.h"
+#include "exec/hwaddr.h"
+#include "exec/memory.h"
 #include "fuzzer_api.h"
+#include "hw/core/cpu.h"
 #include "migration/snapshot.h"
+#include "qemu/int128.h"
 #include "qemu/osdep.h"
 
 #include "cpu.h"
@@ -34,6 +38,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +46,68 @@
 #include <sys/shm.h>
 #include <unistd.h>
 
+typedef struct {
+    sem_t sem;
+    int v;
+} os_state_t;
+
+typedef struct {
+    pthread_mutex_t mutex;
+
+    bool coverage_active;
+    target_ulong base;
+    target_ulong limit;
+    const char *testcase_path;
+    char *testcase;
+    size_t testcase_size;
+    os_state_t *os_state;
+    bool state_saved;
+    bool do_restore;
+
+    QEMUBH *savevm_cb;
+    QEMUBH *loadvm_cb;
+
+    target_ulong prev_pc;
+    char *bitmap;
+
+#if defined(TARGET_AARCH64)
+    CPUARMState env;
+    uint8_t *mpu_regs;
+    GList *saved_mem;
+    bool do_fast_save_restore;
+#endif
+
+} fuzzer_t;
+
+typedef struct {
+    const char *name;
+    uint8_t *mem;
+    MemoryRegion *mr;
+    Int128 len;
+} SavedMemRegion;
+
+#define FUZZER_FAIL -69
+
+#define FUZZER_OS_STATE_FD 399
+#define FUZZER_RESTORE_EVENT_FD 400
+#define FUZZER_BITMAP_SIZE 1 << 16
+
+static fuzzer_t gFuzzer = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .coverage_active = false,
+    .base = 0,
+    .limit = (target_ulong) 0xffffffffffffffffULL,
+    .do_fast_save_restore = false
+};
+
+static fuzzer_t *fuzzer_lock(void) {
+    pthread_mutex_lock(&gFuzzer.mutex);
+    return &gFuzzer;
+}
+
+static void fuzzer_unlock(fuzzer_t *fuzzer) {
+    pthread_mutex_unlock(&fuzzer->mutex);
+}
 static void log_to_file(FILE *f, const char * file, int line, const char *fmt, va_list list) {
     qemu_fprintf(f, "FUZZER_DEBUG [%s:%d]: ", file, line);
     qemu_vfprintf(f, fmt, list);
@@ -77,6 +144,13 @@ static void _log(const char * file, int line, const char *fmt, ...) {
 #define FUZZER_EXIT                 143 // udf 143
 #define FUZZER_LOG                  144 // udf 144
 
+static void mark_as_jump(DisasContext *s) {
+    fuzzer_t *f = fuzzer_lock();
+    if (f->do_fast_save_restore)
+        s->base.is_jmp = DISAS_JUMP;
+    fuzzer_unlock(f);
+}
+
 int fuzzer_translate_instr(DisasContext *s) {
     switch (s->insn) {
         case FUZZER_FORKSERVER:
@@ -102,10 +176,12 @@ int fuzzer_translate_instr(DisasContext *s) {
         case FUZZER_KILL:
             LOG("Translating instruction FUZZER_KILL\n");
             gen_helper_fuzzer_kill();
+            mark_as_jump(s);
             break;
         case FUZZER_EXIT:
             LOG("Translating instruction FUZZER_EXIT\n");
             gen_helper_fuzzer_exit();
+            mark_as_jump(s);
             break;
         case FUZZER_LOG:
             LOG("Translating instruction FUZZER_LOG\n");
@@ -137,58 +213,123 @@ static void set_reg(uint8_t n, target_ulong v) {
     }
 }
 
+static void fast_save_cpu(fuzzer_t *f) {
+    memcpy(&f->env, &ARM_CPU(current_cpu)->env, sizeof(f->env));
+    LOG("CPU state saved fast\n");
+}
+
+static void fast_restore_cpu(fuzzer_t *f) {
+    memcpy(&ARM_CPU(current_cpu)->env, &f->env, sizeof(f->env));
+    LOG("CPU state loaded fast\n");
+}
+
+static void fast_save_mpu_regs(fuzzer_t *f) {
+    ARMCPU *arm = ARM_CPU(current_cpu);
+
+    size_t size = 
+        2 * M_REG_NUM_BANKS * arm->pmsav7_dregion * sizeof(uint32_t) + 
+        2 * arm->sau_sregion * sizeof(uint32_t) + 
+        3 * arm->pmsav7_dregion * sizeof(uint32_t);
+
+    uint8_t *buffer = (uint8_t *) malloc(size);
+    uint8_t *ptr = buffer;
+
+    for (uint32_t i=0; i < M_REG_NUM_BANKS; ++i) {
+        memcpy(ptr, arm->env.pmsav8.rbar[i], arm->pmsav7_dregion * sizeof(uint32_t));
+        ptr += arm->pmsav7_dregion * sizeof(uint32_t);
+    }
+
+    for (uint32_t i=0; i < M_REG_NUM_BANKS; ++i) {
+        memcpy(ptr, arm->env.pmsav8.rlar[i], arm->pmsav7_dregion * sizeof(uint32_t));
+        ptr += arm->pmsav7_dregion * sizeof(uint32_t);
+    }
+
+    memcpy(ptr, arm->env.sau.rbar, arm->sau_sregion * sizeof(uint32_t));
+    ptr += arm->sau_sregion * sizeof(uint32_t);
+
+    memcpy(ptr, arm->env.sau.rlar, arm->sau_sregion * sizeof(uint32_t));
+    ptr += arm->sau_sregion * sizeof(uint32_t);
+
+    f->mpu_regs = buffer;
+}
+
+static void fast_restore_mpu_regs(fuzzer_t *f) {
+    ARMCPU *arm = ARM_CPU(current_cpu);
+    uint8_t *ptr = f->mpu_regs;
+
+    for (uint32_t i=0; i < M_REG_NUM_BANKS; ++i) {
+        memcpy(arm->env.pmsav8.rbar[i], ptr, arm->pmsav7_dregion * sizeof(uint32_t));
+        ptr += arm->pmsav7_dregion * sizeof(uint32_t);
+    }
+
+    for (uint32_t i=0; i < M_REG_NUM_BANKS; ++i) {
+        memcpy(arm->env.pmsav8.rlar[i], ptr, arm->pmsav7_dregion * sizeof(uint32_t));
+        ptr += arm->pmsav7_dregion * sizeof(uint32_t);
+    }
+
+    memcpy(arm->env.sau.rbar, ptr, arm->sau_sregion * sizeof(uint32_t));
+    ptr += arm->sau_sregion * sizeof(uint32_t);
+
+    memcpy(arm->env.sau.rlar, ptr, arm->sau_sregion * sizeof(uint32_t));
+    ptr += arm->sau_sregion * sizeof(uint32_t);
+}
+
+static bool fast_save_memory_region(Int128 start, Int128 len,
+        const MemoryRegion *mr, hwaddr addr, void *ctx) {
+    fuzzer_t *f = (fuzzer_t *) ctx;
+
+    if (mr->ram && !mr->readonly) {
+        SavedMemRegion *sm = (SavedMemRegion *) malloc(sizeof(SavedMemRegion));
+        sm->name = mr->name;
+        sm->mem = malloc(len);
+        sm->len = len;
+        sm->mr = (MemoryRegion *) mr;
+        void *ptr = memory_region_get_ram_ptr((MemoryRegion *) mr);
+        memcpy(sm->mem, ptr, len);
+        f->saved_mem = g_list_append(f->saved_mem, sm);
+        LOG("Saved fast memory region: name = %s, addr = 0x%X, len = 0x%X\n", sm->name, sm->mr->addr, len);
+    }
+
+    return false;
+}
+
+static void fast_restore_memory_region(gpointer data, gpointer ctx) {
+    SavedMemRegion *sm = (SavedMemRegion *) data;
+    void *ptr = memory_region_get_ram_ptr(sm->mr);
+    memcpy(ptr, sm->mem, sm->len);
+    LOG("Resotred fast memory region: name = %s, addr = 0x%X, len = 0x%X\n", sm->name, sm->mr->addr, sm->len);
+}
+
+static void fast_restore_memory(fuzzer_t *f) {
+    g_list_foreach(f->saved_mem, &fast_restore_memory_region, NULL);
+}
+
+static void fast_save_memory(fuzzer_t *f, AddressSpace *as) {
+    FlatView *fv = address_space_to_flatview(as);
+    flatview_for_each_range(fv, &fast_save_memory_region, (void *) f);
+}
+
+static void fast_vmsave(fuzzer_t *f) {
+    fast_save_cpu(f);
+    fast_save_mpu_regs(f);
+    fast_save_memory(f, 
+        cpu_get_address_space(current_cpu, ARMASIdx_S)
+    );
+}
+
+static void fast_vmload(fuzzer_t *f) {
+    tlb_flush(current_cpu);
+    fast_restore_cpu(f);
+    fast_restore_mpu_regs(f);
+    fast_restore_memory(f);
+}
+
 #else
 
 #error "Selected arch is not implemented"
 
 #endif
 
-#define FUZZER_FAIL -69
-
-#define FUZZER_OS_STATE_FD 399
-#define FUZZER_RESTORE_EVENT_FD 400
-#define FUZZER_BITMAP_SIZE 1 << 16
-
-typedef struct {
-    sem_t sem;
-    int v;
-} os_state_t;
-
-typedef struct {
-    pthread_mutex_t mutex;
-
-    bool coverage_active;
-    target_ulong base;
-    target_ulong limit;
-    const char *testcase_path;
-    char *testcase;
-    size_t testcase_size;
-    os_state_t *os_state;
-    bool state_saved;
-    bool do_restore;
-
-    QEMUBH *savevm_cb;
-    QEMUBH *loadvm_cb;
-
-    target_ulong prev_pc;
-    char *bitmap;
-} fuzzer_t;
-
-static fuzzer_t gFuzzer = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .coverage_active = false,
-    .base = 0,
-    .limit = (target_ulong) 0xffffffffffffffffULL
-};
-
-static fuzzer_t *fuzzer_lock(void) {
-    pthread_mutex_lock(&gFuzzer.mutex);
-    return &gFuzzer;
-}
-
-static void fuzzer_unlock(fuzzer_t *fuzzer) {
-    pthread_mutex_unlock(&fuzzer->mutex);
-}
 
 static void vmsave_cb(void *_) {
     LOG("Saving snapshot\n");
@@ -236,11 +377,6 @@ static void vmsave(fuzzer_t *f) {
 }
 
 static void vmload(fuzzer_t *f) {
-    if (!f->state_saved) {
-        LOG("VM state not saved, exiting\n");
-        exit(FUZZER_FAIL);
-    }
-
 
     // Close all other vCPUs
     fuzzer_unlock(f);
@@ -269,7 +405,15 @@ static void send_state(fuzzer_t *f, int v) {
     }
 
     if (f->do_restore) {
-        vmload(f);
+        if (!f->state_saved) {
+            LOG("VM state not saved, exiting\n");
+            exit(FUZZER_FAIL);
+        }
+
+        if (f->do_fast_save_restore)
+            fast_vmload(f);
+        else
+            vmload(f);
     } else {
         exit(v);
     }
@@ -279,7 +423,10 @@ void HELPER(fuzzer_forkserver)(void) {
     fuzzer_t *f = fuzzer_lock();
 
     if (!f->state_saved) {
-        vmsave(f);
+        if (f->do_fast_save_restore) 
+            fast_vmsave(f);
+        else
+            vmsave(f);
         f->state_saved = true;
     }
     
@@ -425,6 +572,7 @@ void fuzzer_init(void) {
         f->bitmap = NULL;
     }
 
+    f->do_fast_save_restore = !getenv("FUZZER_FAST_VMSAVE");
 
     fuzzer_unlock(f);
 }
