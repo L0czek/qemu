@@ -143,6 +143,7 @@ static void _log(const char * file, int line, const char *fmt, ...) {
 #define FUZZER_KILL                 142 // udf 142
 #define FUZZER_EXIT                 143 // udf 143
 #define FUZZER_LOG                  144 // udf 144
+#define FUZZER_SEND_STATE_NO_REVERT 145 // udf 145
 
 static void mark_as_jump(DisasContext *s) {
     fuzzer_t *f = fuzzer_lock();
@@ -182,6 +183,10 @@ int fuzzer_translate_instr(DisasContext *s) {
             LOG("Translating instruction FUZZER_EXIT\n");
             gen_helper_fuzzer_exit();
             mark_as_jump(s);
+            break;
+        case FUZZER_SEND_STATE_NO_REVERT:
+            LOG("Translating instruction FUZZER_SEND_STATE_NO_REVERT\n");
+            gen_helper_fuzzer_send_state_no_revert();
             break;
         case FUZZER_LOG:
             LOG("Translating instruction FUZZER_LOG\n");
@@ -396,14 +401,14 @@ static void await_fuzzer(fuzzer_t *f) {
     sem_wait(&f->os_state->sem);
 }
 
-static void send_state(fuzzer_t *f, int v) {
-    LOG("Sending OS state: %d\n", v);
+static void killself(int v) {
+    if (__WIFSIGNALED(v)) 
+        kill(getpid(), __WSTOPSIG(v));
+    else
+        exit(__WEXITSTATUS(v));
+}
 
-    if (f->os_state) {
-        f->os_state->v = v;
-        await_fuzzer(f);
-    }
-
+static bool try_restore_vm(fuzzer_t *f) {
     if (f->do_restore) {
         if (!f->state_saved) {
             LOG("VM state not saved, exiting\n");
@@ -414,9 +419,23 @@ static void send_state(fuzzer_t *f, int v) {
             fast_vmload(f);
         else
             vmload(f);
-    } else {
-        exit(v);
+
+        return true;
     }
+
+    return false;
+}
+
+static void send_state(fuzzer_t *f, int v, bool try_restore) {
+    LOG("Sending OS state: %d\n", v);
+
+    if (f->os_state) {
+        f->os_state->v = v;
+        await_fuzzer(f);
+    }
+
+    if (try_restore && !try_restore_vm(f))
+        killself(v);
 }
 
 void HELPER(fuzzer_forkserver)(void) {
@@ -457,7 +476,7 @@ void HELPER(fuzzer_fetch_testcase)(void) {
     
     if (!f->testcase) {
         if (!f->testcase_path) {
-            LOG("No testcase specyfing, exitting\n");
+            LOG("No testcase specyfied, exitting\n");
             exit(FUZZER_FAIL);
         }
 
@@ -467,11 +486,13 @@ void HELPER(fuzzer_fetch_testcase)(void) {
         rewind(file);
         f->testcase = malloc(size);
         f->testcase_size = size;
+        LOG("testcase_len: %d\n", f->testcase_size);
 
         if (fread(f->testcase, sizeof(char), size, file) == -1) {
             LOG("Cannot read testcase from file %s, reason: %s", f->testcase_path, strerror(errno));
             exit(FUZZER_FAIL);
         }
+        fclose(file);
     }
 
     target_ulong dst = reg(0);
@@ -483,19 +504,19 @@ void HELPER(fuzzer_fetch_testcase)(void) {
         f->testcase = NULL;
     }
 
-    set_reg(0, f->testcase_size);
+    set_reg(1, f->testcase_size);
     fuzzer_unlock(f);
 }
 
 void HELPER(fuzzer_kill)(void) {
     fuzzer_t *f = fuzzer_lock();
-    send_state(f, __W_EXITCODE(0, reg(0)));
+    send_state(f, __W_EXITCODE(0, reg(0)), true);
     fuzzer_unlock(f);
 }
 
 void HELPER(fuzzer_exit)(void) {
     fuzzer_t *f = fuzzer_lock();
-    send_state(f, __W_EXITCODE(reg(0), 0));
+    send_state(f, __W_EXITCODE(reg(0), 0), true);
     fuzzer_unlock(f);
 }
 
@@ -508,6 +529,12 @@ void HELPER(fuzzer_log)(void) {
     msg[len] = 0;
     LOG("Message from OS [%s]\n", msg);
     free(msg);
+}
+
+void HELPER(fuzzer_send_state_no_revert)(void) {
+    fuzzer_t *f = fuzzer_lock();
+    send_state(f, __W_EXITCODE(reg(0), 0), false);
+    fuzzer_unlock(f);
 }
 
 void HELPER(fuzzer_log_pc)(uint64_t h) {
@@ -525,7 +552,7 @@ void fuzzer_set_testcase_file(const char *path) {
 static void restore_event_handler(void *_) {
     fuzzer_t *f = fuzzer_lock();
     LOG("Requested to restore vm\n");
-    send_state(f, __W_EXITCODE(0, SIGUSR1));
+    send_state(f, __W_EXITCODE(0, SIGUSR1), true);
     fuzzer_unlock(f);
 }
 
