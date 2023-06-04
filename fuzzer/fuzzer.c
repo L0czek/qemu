@@ -1,5 +1,6 @@
 #include "fuzzer.h"
 #include "block/aio.h"
+#include "exec/cpu-common.h"
 #include "exec/hwaddr.h"
 #include "exec/memory.h"
 #include "fuzzer_api.h"
@@ -69,6 +70,8 @@ typedef struct {
 
     target_ulong prev_pc;
     char *bitmap;
+
+    const char *tc_dir;
 
 #if defined(TARGET_AARCH64)
     CPUARMState env;
@@ -144,6 +147,7 @@ static void _log(const char * file, int line, const char *fmt, ...) {
 #define FUZZER_EXIT                 143 // udf 143
 #define FUZZER_LOG                  144 // udf 144
 #define FUZZER_SEND_STATE_NO_REVERT 145 // udf 145
+#define FUZZER_SAVE_TC              146 // udf 146
 
 static void mark_as_jump(DisasContext *s) {
     fuzzer_t *f = fuzzer_lock();
@@ -191,6 +195,10 @@ int fuzzer_translate_instr(DisasContext *s) {
         case FUZZER_LOG:
             LOG("Translating instruction FUZZER_LOG\n");
             gen_helper_fuzzer_log();
+            break;
+        case FUZZER_SAVE_TC:
+            LOG("Translating instruction FUZZER_SAVE_TC\n");
+            gen_helper_fuzzer_save_tc();
             break;
         default: 
             return 0;
@@ -543,6 +551,53 @@ void HELPER(fuzzer_log_pc)(uint64_t h) {
     fuzzer_unlock(f);
 }
 
+void HELPER(fuzzer_save_tc)(void) {
+    fuzzer_t *f = fuzzer_lock();
+
+    if (!f->tc_dir)
+        return;
+
+    vaddr name_ptr = reg(0);
+    size_t name_len = reg(1);
+    void *name = calloc(name_len + 1, sizeof(char));
+    cpu_memory_rw_debug(current_cpu, name_ptr, name, name_len, false); 
+
+    vaddr tc_ptr = reg(2);
+    size_t tc_len = reg(3);
+    void *tc = malloc(tc_len);
+    cpu_memory_rw_debug(current_cpu, tc_ptr, tc, tc_len, false);
+
+    char *path = basename(name);
+    if (!strcmp(path, ".") || !strcmp(path, "..")) {
+        LOG("Something strange is happening with the path\n");
+        exit(FUZZER_FAIL);
+    }
+
+    size_t full_path_len = strlen(f->tc_dir) + 1 + strlen(path) + 1;
+    char *full_path = malloc(full_path_len);
+
+    if (snprintf(full_path, full_path_len, "%s/%s", f->tc_dir, path) < 0) {
+        LOG("Joining paths for tc to save failed\n");
+        exit(FUZZER_FAIL);
+    }
+
+    FILE *file = fopen(full_path, "wb");
+    if (!file) {
+        LOG("Failed to open file for testcase, reason: %s\n", strerror(errno));
+        exit(FUZZER_FAIL);
+    }
+
+    if (fwrite(tc, sizeof(char), tc_len, file) != tc_len) {
+        LOG("Didn't write all testcase, exiting\n");
+        exit(FUZZER_FAIL);
+    }
+
+    fclose(file);
+    free(tc);
+    free(name);
+    fuzzer_unlock(f);
+}
+
 void fuzzer_set_testcase_file(const char *path) {
     fuzzer_t *f = fuzzer_lock();
     f->testcase_path = path;
@@ -599,7 +654,9 @@ void fuzzer_init(void) {
         f->bitmap = NULL;
     }
 
-    f->do_fast_save_restore = !getenv("FUZZER_FAST_VMSAVE");
+    f->do_fast_save_restore = getenv("FUZZER_FAST_VMSAVE") != NULL;
+
+    f->tc_dir = getenv("FUZZER_TC_SAVE_DIR");
 
     fuzzer_unlock(f);
 }
